@@ -90,16 +90,11 @@
 #include <linux/rodata_test.h>
 
 #include <asm/io.h>
+#include <asm/bugs.h>
 #include <asm/setup.h>
 #include <asm/sections.h>
 #include <asm/cacheflush.h>
-
-#ifdef CONFIG_MTK_RAM_CONSOLE
-#include <mt-plat/mtk_ram_console.h>
-#endif
-
-#define CREATE_TRACE_POINTS
-#include <trace/events/initcall.h>
+#include <soc/qcom/boot_stats.h>
 
 static int kernel_init(void *);
 
@@ -381,6 +376,29 @@ static void __init setup_command_line(char *command_line)
 	strcpy(static_command_line, command_line);
 }
 
+static void __init sanitize_boot_cmdline(char *cmdline)
+{
+	char *p;
+
+	if (!cmdline)
+		return;
+
+	/* 1. Ép verifiedbootstate về green */
+	p = strstr(cmdline, "androidboot.verifiedbootstate=orange");
+	if (p)
+		memcpy(p, "androidboot.verifiedbootstate=green ", 36);
+
+	/* 2. Đổi cờ flash.locked về 1 (đã khóa) */
+	p = strstr(cmdline, "androidboot.flash.locked=0");
+	if (p)
+		memcpy(p, "androidboot.flash.locked=1", 26);
+
+	/* 3. Đổi trạng thái vbmeta về locked */
+	p = strstr(cmdline, "androidboot.vbmeta.device_state=unlocked");
+	if (p)
+		memcpy(p, "androidboot.vbmeta.device_state=locked  ", 40);
+}
+
 /*
  * We need to finalize in a non-__init function or else race conditions
  * between the root thread and the init thread may cause start_kernel to
@@ -492,21 +510,21 @@ void __init __weak thread_stack_cache_init(void)
 }
 #endif
 
+void __init __weak mem_encrypt_init(void) { }
+
 /* Report memory auto-initialization states for this boot. */
 static void __init report_meminit(void)
 {
 	const char *stack;
 
-	if (IS_ENABLED(CONFIG_INIT_STACK_ALL_PATTERN))
-		stack = "all(pattern)";
-	else if (IS_ENABLED(CONFIG_INIT_STACK_ALL_ZERO))
-		stack = "all(zero)";
+	if (IS_ENABLED(CONFIG_INIT_STACK_ALL))
+		stack = "all";
 	else if (IS_ENABLED(CONFIG_GCC_PLUGIN_STRUCTLEAK_BYREF_ALL))
-		stack = "byref_all(zero)";
+		stack = "byref_all";
 	else if (IS_ENABLED(CONFIG_GCC_PLUGIN_STRUCTLEAK_BYREF))
-		stack = "byref(zero)";
+		stack = "byref";
 	else if (IS_ENABLED(CONFIG_GCC_PLUGIN_STRUCTLEAK_USER))
-		stack = "__user(zero)";
+		stack = "__user";
 	else
 		stack = "off";
 
@@ -545,6 +563,7 @@ asmlinkage __visible void __init start_kernel(void)
 	char *after_dashes;
 
 	set_task_stack_end_magic(&init_task);
+
 	smp_setup_processor_id();
 	debug_objects_early_init();
 
@@ -561,10 +580,23 @@ asmlinkage __visible void __init start_kernel(void)
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	setup_arch(&command_line);
+
+	/* Chèn lọc cmdline ngay khi Bootloader vừa bàn giao chuỗi qua RAM */
+	sanitize_boot_cmdline(boot_command_line);
+	sanitize_boot_cmdline(command_line);
+
+	/*
+	 * Set up the the initial canary and entropy after arch
+	 * and after adding latent and command line entropy.
+	 */
+	add_latent_entropy();
+	add_device_randomness(command_line, strlen(command_line));
+	boot_init_stack_canary();
 	mm_init_cpumask(&init_mm);
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
 	setup_per_cpu_areas();
+	softirq_early_init();
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
 	boot_cpu_hotplug_init();
 
@@ -638,17 +670,6 @@ asmlinkage __visible void __init start_kernel(void)
 	softirq_init();
 	timekeeping_init();
 	time_init();
-
-	/*
-	 * For best initial stack canary entropy, prepare it after:
-	 * - setup_arch() for any UEFI RNG entropy and boot cmdline access
-	 * - timekeeping_init() for ktime entropy used in random_init()
-	 * - time_init() for making random_get_entropy() work on some platforms
-	 * - random_init() to initialize the RNG from from early entropy sources
-	 */
-	random_init(command_line);
-	boot_init_stack_canary();
-
 	sched_clock_postinit();
 	printk_safe_init();
 	perf_event_init();
@@ -679,6 +700,14 @@ asmlinkage __visible void __init start_kernel(void)
 	 */
 	locking_selftest();
 
+	/*
+	 * This needs to be called before any devices perform DMA
+	 * operations that might use the SWIOTLB bounce buffers. It will
+	 * mark the bounce buffers as decrypted so that their usage will
+	 * not cause "plain-text" data to be decrypted when accessed.
+	 */
+	mem_encrypt_init();
+
 #ifdef CONFIG_BLK_DEV_INITRD
 	if (initrd_start && !initrd_below_start_ok &&
 	    page_to_pfn(virt_to_page((void *)initrd_start)) < min_low_pfn) {
@@ -695,10 +724,7 @@ asmlinkage __visible void __init start_kernel(void)
 	if (late_time_init)
 		late_time_init();
 	calibrate_delay();
-
-	arch_cpu_finalize_init();
-
-	pid_idr_init();
+	pidmap_init();
 	anon_vma_init();
 	acpi_early_init();
 #ifdef CONFIG_X86
@@ -723,6 +749,7 @@ asmlinkage __visible void __init start_kernel(void)
 	taskstats_init_early();
 	delayacct_init();
 
+	check_bugs();
 
 	acpi_subsystem_init();
 	arch_post_acpi_subsys_init();
@@ -777,7 +804,7 @@ static int __init initcall_blacklist(char *str)
 		}
 	} while (str_entry);
 
-	return 1;
+	return 0;
 }
 
 static bool __init_or_module initcall_blacklisted(initcall_t fn)
@@ -838,36 +865,20 @@ static int __init_or_module do_one_initcall_debug(initcall_t fn)
 
 	return ret;
 }
-#ifdef CONFIG_MTPROF
-#include <bootprof.h>
-#else
-#define TIME_LOG_START()
-#define TIME_LOG_END()
-#define bootprof_initcall(fn, ts)
-#endif
 
 int __init_or_module do_one_initcall(initcall_t fn)
 {
 	int count = preempt_count();
 	int ret;
 	char msgbuf[64];
-#ifdef CONFIG_MTPROF
-	unsigned long long ts = 0;
-#endif
+
 	if (initcall_blacklisted(fn))
 		return -EPERM;
 
-#ifdef CONFIG_MTK_RAM_CONSOLE
-	aee_rr_rec_last_init_func((unsigned long)fn);
-#endif
-	TIME_LOG_START();
-	trace_initcall_start(fn);
 	if (initcall_debug)
 		ret = do_one_initcall_debug(fn);
 	else
 		ret = fn();
-	TIME_LOG_END();
-	trace_initcall_finish(fn, ret);
 
 	msgbuf[0] = 0;
 
@@ -882,23 +893,22 @@ int __init_or_module do_one_initcall(initcall_t fn)
 	WARN(msgbuf[0], "initcall %pF returned with %s\n", fn, msgbuf);
 
 	add_latent_entropy();
-	bootprof_initcall(fn, ts);
 	return ret;
 }
 
 
-extern initcall_entry_t __initcall_start[];
-extern initcall_entry_t __initcall0_start[];
-extern initcall_entry_t __initcall1_start[];
-extern initcall_entry_t __initcall2_start[];
-extern initcall_entry_t __initcall3_start[];
-extern initcall_entry_t __initcall4_start[];
-extern initcall_entry_t __initcall5_start[];
-extern initcall_entry_t __initcall6_start[];
-extern initcall_entry_t __initcall7_start[];
-extern initcall_entry_t __initcall_end[];
+extern initcall_t __initcall_start[];
+extern initcall_t __initcall0_start[];
+extern initcall_t __initcall1_start[];
+extern initcall_t __initcall2_start[];
+extern initcall_t __initcall3_start[];
+extern initcall_t __initcall4_start[];
+extern initcall_t __initcall5_start[];
+extern initcall_t __initcall6_start[];
+extern initcall_t __initcall7_start[];
+extern initcall_t __initcall_end[];
 
-static initcall_entry_t *initcall_levels[] __initdata = {
+static initcall_t *initcall_levels[] __initdata = {
 	__initcall0_start,
 	__initcall1_start,
 	__initcall2_start,
@@ -924,7 +934,7 @@ static char *initcall_level_names[] __initdata = {
 
 static void __init do_initcall_level(int level)
 {
-	initcall_entry_t *fn;
+	initcall_t *fn;
 
 	strcpy(initcall_command_line, saved_command_line);
 	parse_args(initcall_level_names[level],
@@ -933,20 +943,19 @@ static void __init do_initcall_level(int level)
 		   level, level,
 		   NULL, &repair_env_string);
 
-	trace_initcall_level(initcall_level_names[level]);
 	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
-		do_one_initcall(initcall_from_entry(fn));
+		do_one_initcall(*fn);
 }
 
 static void __init do_initcalls(void)
 {
 	int level;
 
-	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
 		do_initcall_level(level);
-#ifdef CONFIG_MTK_RAM_CONSOLE
-	aee_rr_rec_last_init_func(~(unsigned long)(0));
-#endif
+		/* finish all async calls before going into next level */
+		async_synchronize_full();
+	}
 }
 
 /*
@@ -969,11 +978,10 @@ static void __init do_basic_setup(void)
 
 static void __init do_pre_smp_initcalls(void)
 {
-	initcall_entry_t *fn;
+	initcall_t *fn;
 
-	trace_initcall_level("early");
 	for (fn = __initcall_start; fn < __initcall0_start; fn++)
-		do_one_initcall(initcall_from_entry(fn));
+		do_one_initcall(*fn);
 }
 
 /*
@@ -1015,9 +1023,7 @@ static noinline void __init kernel_init_freeable(void);
 bool rodata_enabled __ro_after_init = true;
 static int __init set_debug_rodata(char *str)
 {
-	if (strtobool(str, &rodata_enabled))
-		pr_warn("Invalid option string for rodata: '%s'\n", str);
-	return 1;
+	return strtobool(str, &rodata_enabled);
 }
 __setup("rodata=", set_debug_rodata);
 #endif
@@ -1059,9 +1065,8 @@ static int __ref kernel_init(void *unused)
 	numa_default_policy();
 
 	rcu_end_inkernel_boot();
-#ifdef CONFIG_MTPROF
-		log_boot("Kernel_init_done");
-#endif
+	place_marker("M - DRIVER Kernel Boot Done");
+
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
@@ -1108,11 +1113,12 @@ static noinline void __init kernel_init_freeable(void)
 	 */
 	set_mems_allowed(node_states[N_MEMORY]);
 
-	cad_pid = get_pid(task_pid(current));
+	cad_pid = task_pid(current);
 
 	smp_prepare_cpus(setup_max_cpus);
 
 	workqueue_init();
+	kthread_init_global_worker();
 
 	init_mm_internals();
 
@@ -1146,6 +1152,7 @@ static noinline void __init kernel_init_freeable(void)
 		ramdisk_execute_command = NULL;
 		prepare_namespace();
 	}
+	launch_early_services();
 
 	/*
 	 * Ok, we have completed the initial bootup, and
