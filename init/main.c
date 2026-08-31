@@ -372,6 +372,37 @@ static inline void smp_prepare_cpus(unsigned int maxcpus) { }
  */
 static void __init setup_command_line(char *command_line)
 {
+	char *p;
+
+	/* 1. Verifiedbootstate: orange -> green */
+	p = strstr(boot_command_line, "androidboot.verifiedbootstate=orange");
+	if (p) memcpy(p + 30, "green ", 6);
+
+	/* 2. Flash locked: 0 -> 1 */
+	p = strstr(boot_command_line, "androidboot.flash.locked=0");
+	if (p) *(p + 25) = '1';
+
+	/* 3. Vbmeta device state: unlocked -> locked */
+	p = strstr(boot_command_line, "androidboot.vbmeta.device_state=unlocked");
+	if (p) memcpy(p + 32, "locked  ", 8);
+
+	/* 4. Veritymode: disabled -> enforcing */
+	p = strstr(boot_command_line, "androidboot.veritymode=disabled");
+	if (p) memcpy(p + 23, "enforcing", 9);
+
+	/* Áp dụng tương tự cho command_line */
+	p = strstr(command_line, "androidboot.verifiedbootstate=orange");
+	if (p) memcpy(p + 30, "green ", 6);
+
+	p = strstr(command_line, "androidboot.flash.locked=0");
+	if (p) *(p + 25) = '1';
+
+	p = strstr(command_line, "androidboot.vbmeta.device_state=unlocked");
+	if (p) memcpy(p + 32, "locked  ", 8);
+
+	p = strstr(command_line, "androidboot.veritymode=disabled");
+	if (p) memcpy(p + 23, "enforcing", 9);
+
 	saved_command_line =
 		memblock_virt_alloc(strlen(boot_command_line) + 1, 0);
 	initcall_command_line =
