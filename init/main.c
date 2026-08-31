@@ -380,29 +380,6 @@ static void __init setup_command_line(char *command_line)
 	strcpy(saved_command_line, boot_command_line);
 	strcpy(static_command_line, command_line);
 }
-static void __init sanitize_boot_cmdline(char *cmdline)
-{
-	char *p;
-
-	if (!cmdline)
-		return;
-
-	/* 1. Ep verifiedbootstate ve green */
-	p = strstr(cmdline, "androidboot.verifiedbootstate=orange");
-	if (p)
-		memcpy(p, "androidboot.verifiedbootstate=green ", 36);
-
-	/* 2. Doi co flash.locked ve 1 (da khoa) */
-	p = strstr(cmdline, "androidboot.flash.locked=0");
-	if (p)
-		memcpy(p, "androidboot.flash.locked=1", 26);
-
-	/* 3. Doi trang thai vbmeta ve locked */
-	p = strstr(cmdline, "androidboot.vbmeta.device_state=unlocked");
-	if (p)
-		memcpy(p, "androidboot.vbmeta.device_state=locked  ", 40);
-}
-
 
 /*
  * We need to finalize in a non-__init function or else race conditions
@@ -584,8 +561,6 @@ asmlinkage __visible void __init start_kernel(void)
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	setup_arch(&command_line);
-	sanitize_boot_cmdline(boot_command_line);
-	sanitize_boot_cmdline(command_line);
 	mm_init_cpumask(&init_mm);
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
