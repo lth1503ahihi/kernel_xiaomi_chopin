@@ -6,8 +6,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # Cấp quyền tạo Release
 
     steps:
       - name: Checkout Source Code
@@ -21,21 +19,10 @@ jobs:
       - name: Run Build Script
         run: |
           chmod +x build.sh
-          ./build.sh chopin 2>&1 | tee build.log
+          ./build.sh chopin
 
-      - name: Upload Build Log
-        if: always()
+      - name: Upload Flashable Zip
         uses: actions/upload-artifact@v4
         with:
-          name: Build-Log-Chopin
-          path: build.log
-
-      - name: Create GitHub Release
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: kernel-build-${{ github.run_number }}
-          name: Chopin Kernel Build #${{ github.run_number }}
-          files: "**/*.zip"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: HydrogenKernel-Chopin-Spoofed
+          path: "*.zip"
