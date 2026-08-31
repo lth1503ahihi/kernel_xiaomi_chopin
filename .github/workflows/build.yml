@@ -1,1 +1,28 @@
+name: Build Chopin Kernel
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential bc bison flex libssl-dev libelf-dev zip ccache
+
+      - name: Run Build Script
+        run: |
+          chmod +x build.sh
+          ./build.sh chopin
+
+      - name: Upload Flashable Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: HydrogenKernel-Chopin-Spoofed
+          path: "*.zip"
