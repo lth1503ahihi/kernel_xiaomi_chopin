@@ -92,8 +92,7 @@
 #include <asm/io.h>
 #include <asm/setup.h>
 #include <asm/sections.h>
-#include <asm/cacheflush.h>
-#include <soc/qcom/boot_stats.h>
+#include <asm/cacheflush.h
 
 static int kernel_init(void *);
 
