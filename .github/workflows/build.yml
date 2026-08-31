@@ -19,9 +19,18 @@ jobs:
       - name: Run Build Script
         run: |
           chmod +x build.sh
-          ./build.sh chopin
+          # Ghi toàn bộ output ra file build.log và vẫn in ra màn hình console
+          ./build.sh chopin 2>&1 | tee build.log
+
+      - name: Upload Build Log
+        if: always() # Luôn lưu log kể cả khi build thất bại để soi lỗi
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-Log-Chopin
+          path: build.log
 
       - name: Upload Flashable Zip
+        if: success() # Chỉ upload zip khi build thành công
         uses: actions/upload-artifact@v4
         with:
           name: HydrogenKernel-Chopin-Spoofed
