@@ -6,8 +6,7 @@
 
 static int cmdline_proc_show(struct seq_file *m, void *v)
 {
- /* In nguyên vẹn cmdline gốc, sau đó ghi đè cờ locked/green vào đuôi */
- seq_printf(m, "%s androidboot.verifiedbootstate=green androidboot.flash.locked=1 androidboot.vbmeta.device_state=locked\n", saved_command_line);
+ seq_printf(m, "%s\n", saved_command_line);
  return 0;
 }
 
