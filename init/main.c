@@ -372,46 +372,6 @@ static inline void smp_prepare_cpus(unsigned int maxcpus) { }
  */
 static void __init setup_command_line(char *command_line)
 {
-	char *p;
-
-	/* 1. Thay orange (6 byte) -> green (5 byte) và dồn chuỗi lùi 1 byte */
-	p = strstr(boot_command_line, "androidboot.verifiedbootstate=orange");
-	if (p) {
-		memcpy(p + 30, "green", 5);
-		memmove(p + 35, p + 36, strlen(p + 36) + 1);
-	}
-
-	/* 2. Thay unlocked (8 byte) -> locked (6 byte) và dồn chuỗi lùi 2 byte */
-	p = strstr(boot_command_line, "androidboot.vbmeta.device_state=unlocked");
-	if (p) {
-		memcpy(p + 32, "locked", 6);
-		memmove(p + 38, p + 40, strlen(p + 40) + 1);
-	}
-
-	/* 3. Đổi 0 thành 1 cho flash.locked */
-	p = strstr(boot_command_line, "androidboot.flash.locked=0");
-	if (p) {
-		*(p + 25) = '1';
-	}
-
-	/* Áp dụng tương tự cho command_line */
-	p = strstr(command_line, "androidboot.verifiedbootstate=orange");
-	if (p) {
-		memcpy(p + 30, "green", 5);
-		memmove(p + 35, p + 36, strlen(p + 36) + 1);
-	}
-
-	p = strstr(command_line, "androidboot.vbmeta.device_state=unlocked");
-	if (p) {
-		memcpy(p + 32, "locked", 6);
-		memmove(p + 38, p + 40, strlen(p + 40) + 1);
-	}
-
-	p = strstr(command_line, "androidboot.flash.locked=0");
-	if (p) {
-		*(p + 25) = '1';
-	}
-
 	saved_command_line =
 		memblock_virt_alloc(strlen(boot_command_line) + 1, 0);
 	initcall_command_line =
