@@ -483,4 +483,8 @@ CONFIG_CRYPTO_TWOFISH=y
 # CONFIG_CRYPTO_HW is not set
 CONFIG_CRC8=y
 CONFIG_BLK_CGROUP=y
-CONFIG_LOCALVERSION_AUTO=N
+CONFIG_LOCALVERSION_AUTO=n
+CONFIG_CMDLINE="cgroup_disable=pressure ramoops_memreserve=4M androidboot.verifiedbootstate=green androidboot.flash.locked=1 androidboot.vbmeta.device_state=locked"
+CONFIG_CMDLINE_EXTEND=y
+# CONFIG_EFI is not set
+CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE=y
