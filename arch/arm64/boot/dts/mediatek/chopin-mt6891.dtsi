@@ -873,7 +873,7 @@ this file is only for attribution of chopin
                 compatible = "novatek,NVT-ts-spi";
                 reg = <0>;
                 status = "ok";
-                spi-max-frequency = <9600000>;  /*4800000,9600000,15000000,19200000 10M*/
+                spi-max-frequency = <19200000>;  /*4800000,9600000,15000000,19200000 10M*/
                 /*novatek,reset-gpio = <&pio 21 0x00>;*/
                 novatek,irq-gpio = <&pio 19 0x2001>;
                 pinctrl-names = "pmx_ts_active", "pmx_ts_suspend";
