@@ -67,8 +67,8 @@ this file is only for attribution of chopin
 	jeita_temp_below_t0_cv = <4200000>;
 	temp_t4_thres = <60>;
 	temp_t4_thres_minus_x_degree = <58>;
-	temp_t3_thres = <48>;
-	temp_t3_thres_minus_x_degree = <47>;
+	temp_t3_thres = <51>;
+	temp_t3_thres_minus_x_degree = <50>;
 	temp_t2_thres = <15>;
 	temp_t2_thres_plus_x_degree = <17>;
 	temp_t1p5_thres = <10>;
