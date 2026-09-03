@@ -82,12 +82,14 @@ page_owner=on loop.max_part=7";
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		cpu0: cpu@000 {
+			cpu0: cpu@000 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a55";
 			reg = <0x0000>;
 			enable-method = "psci";
-			clock-frequency = <1701000000>;
+			capacity-dmips-mhz = <440>;
+			dynamic-power-coefficient = <100>;
+			clock-frequency = <2000000000>;
 			cpu-idle-states = <&cpuoff_l &clusteroff_l
 						&mcusysoff &s2idle>;
 		};
@@ -97,7 +99,9 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a55";
 			reg = <0x0100>;
 			enable-method = "psci";
-			clock-frequency = <1701000000>;
+			capacity-dmips-mhz = <440>;
+			dynamic-power-coefficient = <100>;
+			clock-frequency = <2000000000>;
 			cpu-idle-states = <&cpuoff_l &clusteroff_l
 						&mcusysoff &s2idle>;
 		};
@@ -107,7 +111,9 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a55";
 			reg = <0x0200>;
 			enable-method = "psci";
-			clock-frequency = <1701000000>;
+			capacity-dmips-mhz = <440>;
+			dynamic-power-coefficient = <100>;
+			clock-frequency = <2000000000>;
 			cpu-idle-states = <&cpuoff_l &clusteroff_l
 						&mcusysoff &s2idle>;
 		};
@@ -117,7 +123,9 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a55";
 			reg = <0x0300>;
 			enable-method = "psci";
-			clock-frequency = <1701000000>;
+			capacity-dmips-mhz = <440>;
+			dynamic-power-coefficient = <100>;
+			clock-frequency = <2000000000>;
 			cpu-idle-states = <&cpuoff_l &clusteroff_l
 						&mcusysoff &s2idle>;
 		};
@@ -127,7 +135,9 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a78";
 			reg = <0x0400>;
 			enable-method = "psci";
-			clock-frequency = <2171000000>;
+			capacity-dmips-mhz = <1024>;
+			dynamic-power-coefficient = <420>;
+			clock-frequency = <2600000000>;
 			cpu-idle-states = <&cpuoff_b &clusteroff_b
 						&mcusysoff &s2idle>;
 		};
@@ -137,7 +147,9 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a78";
 			reg = <0x0500>;
 			enable-method = "psci";
-			clock-frequency = <2171000000>;
+			capacity-dmips-mhz = <1024>;
+			dynamic-power-coefficient = <420>;
+			clock-frequency = <2600000000>;
 			cpu-idle-states = <&cpuoff_b &clusteroff_b
 						&mcusysoff &s2idle>;
 		};
@@ -147,7 +159,9 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a78";
 			reg = <0x0600>;
 			enable-method = "psci";
-			clock-frequency = <2171000000>;
+			capacity-dmips-mhz = <1024>;
+			dynamic-power-coefficient = <420>;
+			clock-frequency = <2600000000>;
 			cpu-idle-states = <&cpuoff_b &clusteroff_b
 						&mcusysoff &s2idle>;
 		};
@@ -157,7 +171,9 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a78";
 			reg = <0x0700>;
 			enable-method = "psci";
-			clock-frequency = <2171000000>;
+			capacity-dmips-mhz = <1024>;
+			dynamic-power-coefficient = <420>;
+			clock-frequency = <2600000000>;
 			cpu-idle-states = <&cpuoff_b &clusteroff_b
 						&mcusysoff &s2idle>;
 		};
