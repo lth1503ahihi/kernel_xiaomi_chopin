@@ -2778,7 +2778,21 @@ static int eemg_probe(struct platform_device *pdev)
 	for_each_det(det)
 		eemg_dconfig_set_det(det, node);
 #endif
-
+  	/* Force apply GPU undervolt offsets */
+	for_each_det(det) {
+		switch (det_to_id(det)) {
+		case EEMG_DET_GPU:
+			det->volt_offset = -8;
+			break;
+#if ENABLE_LOO_G
+		case EEMG_DET_GPU_HI:
+			det->volt_offset = -3;
+			break;
+#endif
+		default:
+			break;
+		}
+	}
 	eemg_init01_gpu();
 
 	eemg_debug("%s ok\n", __func__);
