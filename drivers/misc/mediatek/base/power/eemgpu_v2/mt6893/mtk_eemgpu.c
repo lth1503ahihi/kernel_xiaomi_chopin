@@ -2782,11 +2782,11 @@ static int eemg_probe(struct platform_device *pdev)
 	for_each_det(det) {
 		switch (det_to_id(det)) {
 		case EEMG_DET_GPU:
-			det->volt_offset = -8;
+			det->volt_offset = 0;
 			break;
 #if ENABLE_LOO_G
 		case EEMG_DET_GPU_HI:
-			det->volt_offset = -3;
+			det->volt_offset = 0;
 			break;
 #endif
 		default:
