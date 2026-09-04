@@ -135,7 +135,7 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a78";
 			reg = <0x0400>;
 			enable-method = "psci";
-			capacity-dmips-mhz = <1024>;
+			capacity-dmips-mhz = <720>;
 			dynamic-power-coefficient = <420>;
 			clock-frequency = <2600000000>;
 			cpu-idle-states = <&cpuoff_b &clusteroff_b
@@ -147,7 +147,7 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a78";
 			reg = <0x0500>;
 			enable-method = "psci";
-			capacity-dmips-mhz = <1024>;
+			capacity-dmips-mhz = <720>;
 			dynamic-power-coefficient = <420>;
 			clock-frequency = <2600000000>;
 			cpu-idle-states = <&cpuoff_b &clusteroff_b
@@ -159,7 +159,7 @@ page_owner=on loop.max_part=7";
 			compatible = "arm,cortex-a78";
 			reg = <0x0600>;
 			enable-method = "psci";
-			capacity-dmips-mhz = <1024>;
+			capacity-dmips-mhz = <720>;
 			dynamic-power-coefficient = <420>;
 			clock-frequency = <2600000000>;
 			cpu-idle-states = <&cpuoff_b &clusteroff_b
