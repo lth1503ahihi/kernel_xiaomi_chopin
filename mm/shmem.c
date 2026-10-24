@@ -3775,6 +3775,14 @@ SYSCALL_DEFINE2(memfd_create,
 		info->seals &= ~F_SEAL_SEAL;
 	}
 
+	/* ==================================================================== */
+	/* BẮT ĐẦU ĐOẠN THEO DÕI AUDIT                                          */
+	/* In log thông tin tiến trình vừa tạo file ảo trong RAM ra dmesg       */
+	/* ==================================================================== */
+	pr_info("[MEMFD_AUDIT] Process '%s' (PID: %d) vua tao memfd thanh cong: '%s' voi FD = %d\n",
+		current->comm, current->pid, name, fd);
+	/* ==================================================================== */
+
 	fd_install(fd, file);
 	kfree(name);
 	return fd;
@@ -3785,7 +3793,6 @@ err_name:
 	kfree(name);
 	return error;
 }
-
 #endif /* CONFIG_TMPFS */
 
 static void shmem_put_super(struct super_block *sb)
