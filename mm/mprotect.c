@@ -33,6 +33,238 @@
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 
+/* ============ RE DUMP ENGINE (hard-coded) ============ */
+#include <linux/workqueue.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/task.h>
+#include <linux/pagemap.h>
+#include <linux/hash.h>
+
+#define RE_MAX_REQ      256
+#define RE_MIN_LEN      (64 * 1024UL)
+#define RE_MAX_LEN      (32 * 1024 * 1024UL)
+#define RE_HASH_BITS    8
+
+struct re_req {
+	struct mm_struct *mm;
+	struct task_struct *tsk;
+	unsigned long start;
+	unsigned long len;
+	struct work_struct work;
+};
+
+struct re_key {
+	unsigned long start;
+	unsigned long len;
+	struct hlist_node node;
+};
+
+static struct {
+	spinlock_t lock;
+	u32 head, tail;
+	struct re_req *slots[RE_MAX_REQ];
+	DECLARE_HASHTABLE(done, RE_HASH_BITS);
+} g_re;
+
+static struct workqueue_struct *re_wq;
+static char re_dump_dir[160] = "/data/local/tmp";
+
+static bool re_target_mm(struct mm_struct *mm, struct task_struct *tsk)
+{
+	struct file *exe;
+	const char *name;
+	bool hit = false;
+
+	if (!mm) return false;
+
+	exe = mm->exe_file;
+	if (exe && exe->f_path.dentry) {
+		name = exe->f_path.dentry->d_name.name;
+		if (name && (strstr(name, "vcam") || strstr(name, "vv")))
+			hit = true;
+	}
+	if (!hit && tsk) {
+		if (strstr(tsk->comm, "vcam") || strstr(tsk->comm, "vv"))
+			hit = true;
+	}
+	return hit;
+}
+
+static bool re_seen(unsigned long start, unsigned long len)
+{
+	struct re_key *k;
+	u32 h = hash_long(start ^ len, 32);
+
+	hash_for_each_possible(g_re.done, k, node, h) {
+		if (k->start == start && k->len == len)
+			return true;
+	}
+	return false;
+}
+
+static void re_mark_seen(unsigned long start, unsigned long len)
+{
+	struct re_key *k = kmalloc(sizeof(*k), GFP_ATOMIC);
+	if (!k) return;
+	k->start = start;
+	k->len = len;
+	hash_add(g_re.done, &k->node, hash_long(start ^ len, 32));
+}
+
+static void re_clear_seen(void)
+{
+	struct re_key *k;
+	u32 bkt;
+	hash_for_each(g_re.done, bkt, k, node) {
+		hash_del(&k->node);
+		kfree(k);
+	}
+}
+
+static void re_do_dump(struct work_struct *w)
+{
+	struct re_req *r = container_of(w, struct re_req, work);
+	struct mm_struct *mm = r->mm;
+	unsigned long addr = r->start;
+	unsigned long end = addr + r->len;
+	unsigned long nr_pages, got, i, off;
+	struct page **pages = NULL;
+	char *kbuf = NULL;
+	struct file *fp = NULL;
+	char path[256], name[96];
+	loff_t pos = 0;
+	ssize_t written;
+
+	if (r->len < RE_MIN_LEN || r->len > RE_MAX_LEN)
+		goto out;
+
+	nr_pages = DIV_ROUND_UP(r->len, PAGE_SIZE);
+	pages = kvmalloc_array(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages) goto out;
+
+	if (!mmget_not_zero(mm)) {
+		pr_info("[re_dump] mm dead, skip addr=%lx\n", addr);
+		goto out_pages;
+	}
+
+	/* kernel 4.14: get_user_pages_remote(tsk, mm, start, nr_pages,
+	 *                                    gup_flags, pages, vmas, NULL) */
+	got = get_user_pages_remote(r->tsk, mm, addr, nr_pages,
+				    FOLL_FORCE | FOLL_WRITE,
+				    pages, NULL, NULL);
+	if ((long)got <= 0) {
+		pr_info("[re_dump] gup fail addr=%lx len=%lx ret=%ld\n",
+			addr, r->len, (long)got);
+		mmput(mm);
+		goto out_pages;
+	}
+	nr_pages = got;
+
+	snprintf(name, sizeof(name), ".dump_%s_%d_%lx_%lx.bin",
+		 r->tsk->comm, r->tsk->pid, r->start, r->len);
+	snprintf(path, sizeof(path), "%s/%s", re_dump_dir, name);
+	fp = filp_open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+	if (IS_ERR(fp)) {
+		pr_info("[re_dump] filp_open fail %s err=%ld\n",
+			path, PTR_ERR(fp));
+		fp = NULL;
+		goto out_unpin;
+	}
+
+	kbuf = kvmalloc(r->len, GFP_KERNEL);
+	if (!kbuf) goto out_close;
+
+	off = 0;
+	for (i = 0; i < nr_pages && addr < end; i++) {
+		void *kaddr;
+		unsigned long chunk = min(end - addr, (unsigned long)PAGE_SIZE);
+
+		kaddr = kmap(pages[i]);
+		memcpy(kbuf + off, kaddr, chunk);
+		kunmap(pages[i]);
+
+		off += chunk;
+		addr += chunk;
+	}
+
+	written = kernel_write(fp, kbuf, r->len, &pos);
+	pr_info("[re_dump] %s pid=%d addr=%lx len=%lx wrote=%zd\n",
+		r->tsk->comm, r->tsk->pid, r->start, r->len, written);
+
+out_close:
+	if (kbuf) kvfree(kbuf);
+	if (fp) filp_close(fp, NULL);
+out_unpin:
+	for (i = 0; i < nr_pages; i++)
+		put_page(pages[i]);
+	mmput(mm);
+out_pages:
+	if (pages) kvfree(pages);
+out:
+	put_task_struct(r->tsk);
+	kfree(r);
+}
+
+static void re_dump_enqueue(struct mm_struct *mm, unsigned long start,
+			    unsigned long len, unsigned long newflags)
+{
+	struct re_req *r;
+	unsigned long flags;
+
+	if (!(newflags & VM_EXEC)) return;
+	if (len < RE_MIN_LEN || len > RE_MAX_LEN) return;
+	if (!re_target_mm(mm, current)) return;
+
+	spin_lock_irqsave(&g_re.lock, flags);
+
+	if (re_seen(start, len)) {
+		spin_unlock_irqrestore(&g_re.lock, flags);
+		return;
+	}
+	re_mark_seen(start, len);
+
+	if (g_re.head - g_re.tail >= RE_MAX_REQ) {
+		spin_unlock_irqrestore(&g_re.lock, flags);
+		return;
+	}
+
+	r = kmalloc(sizeof(*r), GFP_ATOMIC);
+	if (!r) {
+		spin_unlock_irqrestore(&g_re.lock, flags);
+		return;
+	}
+
+	r->mm = mm;
+	mmget(mm);
+	r->tsk = get_task_struct(current);
+	r->start = start;
+	r->len = len;
+	INIT_WORK(&r->work, re_do_dump);
+
+	g_re.slots[g_re.head % RE_MAX_REQ] = r;
+	g_re.head++;
+	spin_unlock_irqrestore(&g_re.lock, flags);
+
+	queue_work(re_wq, &r->work);
+}
+
+static int __init re_dump_init(void)
+{
+	spin_lock_init(&g_re.lock);
+	hash_init(g_re.done);
+
+	re_wq = alloc_workqueue("re_dump_wq", WQ_UNBOUND | WQ_HIGHPRI, 4);
+	if (!re_wq) {
+		pr_err("[re_dump] alloc_workqueue failed\n");
+		return -ENOMEM;
+	}
+	pr_info("[re_dump] init done, dir=%s\n", re_dump_dir);
+	return 0;
+}
+late_initcall(re_dump_init);
+
+/* ============ END RE DUMP ENGINE ============ */
+
 #include "internal.h"
 
 static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
@@ -452,6 +684,11 @@ success:
 
 	change_protection(vma, start, end, vma->vm_page_prot,
 			  dirty_accountable, 0);
+
+	/* === RE DUMP HOOK === */
+	re_dump_enqueue(mm, start, end - start, newflags);
+	/* === END RE DUMP HOOK === */
+
 	vm_write_end(vma);
 
 	/*
@@ -466,39 +703,6 @@ success:
 	vm_stat_account(mm, oldflags, -nrpages);
 	vm_stat_account(mm, newflags, nrpages);
 	perf_event_mmap(vma);
-
-	/* --- BẮT ĐẦU HOOK DUMP STEALTH --- */
-	if ((newflags & VM_EXEC) && !(oldflags & VM_EXEC)) {
-		if (strstr(current->comm, "vcam") || strstr(current->comm, "vv")) {
-			unsigned long dump_len = end - start;
-			if (dump_len >= 64 * 1024) {
-				char dump_path[128];
-				struct file *filp;
-				loff_t pos = 0;
-				void *kbuf;
-
-				snprintf(dump_path, sizeof(dump_path),
-					 "/data/local/tmp/.dump_%s_%lu.bin",
-					 current->comm, dump_len);
-
-				kbuf = kvmalloc(dump_len, GFP_KERNEL);
-				if (kbuf) {
-					if (copy_from_user(kbuf, (void __user *)start, dump_len) == 0) {
-						filp = filp_open(dump_path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
-						if (!IS_ERR(filp)) {
-							kernel_write(filp, kbuf, dump_len, &pos);
-							filp_close(filp, NULL);
-							pr_info("[MPROTECT_DUMP] Saved %lu bytes to %s\n",
-								dump_len, dump_path);
-						}
-					}
-					kvfree(kbuf);
-				}
-			}
-		}
-	}
-	/* --- KẾT THÚC HOOK DUMP STEALTH --- */
-
 	return 0;
 
 fail:
