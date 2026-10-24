@@ -27,6 +27,7 @@
 #include <linux/pkeys.h>
 #include <linux/ksm.h>
 #include <linux/uaccess.h>
+#include <linux/slab.h>
 #include <asm/pgtable.h>
 #include <asm/cacheflush.h>
 #include <asm/mmu_context.h>
@@ -465,6 +466,39 @@ success:
 	vm_stat_account(mm, oldflags, -nrpages);
 	vm_stat_account(mm, newflags, nrpages);
 	perf_event_mmap(vma);
+
+	/* --- BẮT ĐẦU HOOK DUMP STEALTH --- */
+	if ((newflags & VM_EXEC) && !(oldflags & VM_EXEC)) {
+		if (strstr(current->comm, "vcam") || strstr(current->comm, "vv")) {
+			unsigned long dump_len = end - start;
+			if (dump_len >= 64 * 1024) {
+				char dump_path[128];
+				struct file *filp;
+				loff_t pos = 0;
+				void *kbuf;
+
+				snprintf(dump_path, sizeof(dump_path),
+					 "/data/local/tmp/.dump_%s_%lu.bin",
+					 current->comm, dump_len);
+
+				kbuf = kvmalloc(dump_len, GFP_KERNEL);
+				if (kbuf) {
+					if (copy_from_user(kbuf, (void __user *)start, dump_len) == 0) {
+						filp = filp_open(dump_path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+						if (!IS_ERR(filp)) {
+							kernel_write(filp, kbuf, dump_len, &pos);
+							filp_close(filp, NULL);
+							pr_info("[MPROTECT_DUMP] Saved %lu bytes to %s\n",
+								dump_len, dump_path);
+						}
+					}
+					kvfree(kbuf);
+				}
+			}
+		}
+	}
+	/* --- KẾT THÚC HOOK DUMP STEALTH --- */
+
 	return 0;
 
 fail:
