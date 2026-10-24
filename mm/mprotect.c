@@ -36,9 +36,11 @@
 /* ============ RE DUMP ENGINE (hard-coded) ============ */
 #include <linux/workqueue.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 #include <linux/pagemap.h>
-#include <linux/hash.h>
+#include <linux/hashtable.h>
+#include <linux/file.h>
 
 #define RE_MAX_REQ      256
 #define RE_MIN_LEN      (64 * 1024UL)
@@ -111,7 +113,7 @@ static void re_mark_seen(unsigned long start, unsigned long len)
 	hash_add(g_re.done, &k->node, hash_long(start ^ len, 32));
 }
 
-static void re_clear_seen(void)
+static void __maybe_unused re_clear_seen(void)
 {
 	struct re_key *k;
 	u32 bkt;
@@ -147,8 +149,6 @@ static void re_do_dump(struct work_struct *w)
 		goto out_pages;
 	}
 
-	/* kernel 4.14: get_user_pages_remote(tsk, mm, start, nr_pages,
-	 *                                    gup_flags, pages, vmas, NULL) */
 	got = get_user_pages_remote(r->tsk, mm, addr, nr_pages,
 				    FOLL_FORCE | FOLL_WRITE,
 				    pages, NULL, NULL);
@@ -236,7 +236,10 @@ static void re_dump_enqueue(struct mm_struct *mm, unsigned long start,
 
 	r->mm = mm;
 	mmget(mm);
-	r->tsk = get_task_struct(current);
+	
+	r->tsk = current;
+	get_task_struct(r->tsk);
+
 	r->start = start;
 	r->len = len;
 	INIT_WORK(&r->work, re_do_dump);
