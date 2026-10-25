@@ -43,8 +43,8 @@
 #include <linux/file.h>
 
 #define RE_MAX_REQ      256
-#define RE_MIN_LEN      (64 * 1024UL)
-#define RE_MAX_LEN      (32 * 1024 * 1024UL)
+#define RE_MIN_LEN      (4 * 1024UL)           // Hạ xuống 4KB để bắt được cả các đoạn code nhỏ
+#define RE_MAX_LEN      (64 * 1024 * 1024UL)   // Tăng lên 64MB để chứa đủ code + data
 #define RE_HASH_BITS    8
 
 struct re_req {
@@ -210,10 +210,23 @@ static void re_dump_enqueue(struct mm_struct *mm, unsigned long start,
 {
 	struct re_req *r;
 	unsigned long flags;
+	struct vm_area_struct *vma;
 
 	if (!(newflags & VM_EXEC)) return;
 	if (len < RE_MIN_LEN || len > RE_MAX_LEN) return;
 	if (!re_target_mm(mm, current)) return;
+
+	// Lọc bỏ các thư viện hệ thống rác
+	vma = find_vma(mm, start);
+	if (vma && vma->vm_file) {
+		const char *name = vma->vm_file->f_path.dentry->d_name.name;
+		if (name && (strstr(name, "libc.so") || 
+		             strstr(name, "libart.so") || 
+		             strstr(name, "linker") ||
+		             strstr(name, "libc++.so"))) {
+			return;
+		}
+	}
 
 	spin_lock_irqsave(&g_re.lock, flags);
 
