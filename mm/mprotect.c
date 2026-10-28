@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  mm/mprotect.c
  *
@@ -27,14 +26,13 @@
 #include <linux/pkeys.h>
 #include <linux/ksm.h>
 #include <linux/uaccess.h>
-#include <linux/slab.h>
 #include <asm/pgtable.h>
 #include <asm/cacheflush.h>
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 
 
-/* ============ RE DUMP ENGINE (CLEAN & TARGETED) ============ */
+/* ============ RE DUMP ENGINE FOR KERNEL 4.14 ============ */
 #include <linux/workqueue.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
@@ -43,9 +41,10 @@
 #include <linux/hashtable.h>
 #include <linux/file.h>
 #include <linux/elf.h>
+#include <linux/cred.h>
 
 #define RE_MAX_REQ      64
-#define RE_MIN_LEN      (32 * 1024UL)          // Bắt các lib từ 32KB trở lên (thay vì 1MB)
+#define RE_MIN_LEN      (32 * 1024UL)          // Bắt các lib từ 32KB trở lên
 #define RE_MAX_LEN      (128 * 1024 * 1024UL)  // Tối đa 128MB
 #define RE_HASH_BITS    8
 
@@ -73,9 +72,7 @@ static struct {
 static struct workqueue_struct *re_wq;
 static char re_dump_dir[160] = "/data/local/tmp";
 
-/* 
- * CHỈ BẮT ĐÚNG APP MỤC TIÊU - LOẠI TRỪ 100% DEX2OAT, AAPT, SYSTEM PROCESSES
- */
+/* Chặn 100% dex2oat, aapt, zygote - Chỉ bắt App mục tiêu */
 static bool re_target_mm(struct mm_struct *mm, struct task_struct *tsk)
 {
 	uid_t uid;
@@ -83,22 +80,18 @@ static bool re_target_mm(struct mm_struct *mm, struct task_struct *tsk)
 
 	if (!mm || !tsk || !tsk->group_leader) return false;
 
-	// 1. Chỉ bắt User App: Trên Android mọi app thường có UID >= 10000
 	uid = from_kuid(&init_user_ns, current_uid());
 	if (uid < 10000)
-		return false; // Bỏ qua hoàn toàn dex2oat, aapt, installd, zygote
+		return false; // Bỏ qua dex2oat, aapt, zygote, installd
 
-	// 2. Lấy tên tiến trình cha (tránh trường hợp thread mang tên "main" hay "Binder")
 	pcomm = tsk->group_leader->comm;
 
-	// 3. Blacklist tường minh các tiến trình hệ thống
 	if (strncmp(pcomm, "dex2oat", 7) == 0 ||
 	    strncmp(pcomm, "aapt", 4) == 0 ||
 	    strncmp(pcomm, "zygote", 6) == 0 ||
 	    strncmp(pcomm, "installd", 8) == 0)
 		return false;
 
-	// 4. Khớp với app mục tiêu
 	if (strstr(pcomm, "vcam") != NULL ||
 	    strstr(pcomm, "xnxj") != NULL ||
 	    strstr(tsk->comm, "vcam") != NULL ||
@@ -129,20 +122,7 @@ static void re_mark_seen(unsigned long start, unsigned long len)
 	hash_add(g_re.done, &k->node, hash_long(start ^ len, 32));
 }
 
-static void __maybe_unused re_clear_seen(void)
-{
-	struct re_key *k;
-	u32 bkt;
-	hash_for_each(g_re.done, bkt, k, node) {
-		hash_del(&k->node);
-		kfree(k);
-	}
-}
-
-/*
- * KIỂM TRA ELF HEADER & TÍNH TOÁN KÍCH THƯỚC TOÀN BỘ PHÂN VÙNG
- * NẾU KHÔNG PHẢI ELF THẬT (NHƯ JIT, DEX, HEAP) -> TRẢ VỀ 0 ĐỂ BỎ QUA NGAY
- */
+/* Tính kích thước đầy đủ của ELF (text + data + got + bss) */
 static unsigned long re_calc_elf_size(struct mm_struct *mm, struct task_struct *tsk,
 				      unsigned long start, unsigned long max_len)
 {
@@ -159,10 +139,10 @@ static unsigned long re_calc_elf_size(struct mm_struct *mm, struct task_struct *
 	kunmap(page);
 	put_page(page);
 
-	// BẮT BUỘC PHẢI CÓ MAGIC \x7fELF 64-bit
+	// Bắt buộc phải là ELF 64-bit thật
 	if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
 	    ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-		return 0; // KHÔNG PHẢI ELF -> TRẢ VỀ 0 ĐỂ HUỶ DUMP
+		return 0;
 	}
 
 	for (i = 0; i < ehdr.e_phnum; i++) {
@@ -190,9 +170,6 @@ static unsigned long re_calc_elf_size(struct mm_struct *mm, struct task_struct *
 	return 0;
 }
 
-/*
- * GHI TRỌN GÓI RA /data/local/tmp VỚI LOCK mmap_sem ĐẢM BẢO KHÔNG BỊ SỐ 0
- */
 static void re_do_dump(struct work_struct *w)
 {
 	struct re_req *r = container_of(w, struct re_req, work);
@@ -201,7 +178,7 @@ static void re_do_dump(struct work_struct *w)
 	struct page *page = NULL;
 	char *kbuf = NULL;
 	struct file *fp = NULL;
-	char path[256], name[128];
+	char path[512], name[128];
 	loff_t pos = 0;
 	ssize_t written;
 
@@ -211,7 +188,6 @@ static void re_do_dump(struct work_struct *w)
 
 	dump_len = re_calc_elf_size(mm, r->tsk, r->start, r->len);
 	if (!dump_len) {
-		// Vùng nhớ không phải file ELF thật -> Bỏ qua, không tạo file rác!
 		up_read(&mm->mmap_sem);
 		mmput(mm);
 		goto out;
@@ -225,7 +201,6 @@ static void re_do_dump(struct work_struct *w)
 	
 	fp = filp_open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
 	if (IS_ERR(fp)) {
-		pr_info("[re_dump] filp_open fail %s err=%ld\n", path, PTR_ERR(fp));
 		up_read(&mm->mmap_sem);
 		mmput(mm);
 		goto out;
@@ -253,16 +228,11 @@ static void re_do_dump(struct work_struct *w)
 		}
 
 		written = kernel_write(fp, kbuf, chunk, &pos);
-		if (written < 0) {
-			pr_err("[re_dump] write fail at %lx: %zd\n", addr, written);
+		if (written < 0)
 			break;
-		}
 	}
 
 	up_read(&mm->mmap_sem);
-
-	pr_info("[re_dump] DUMPED FULL: %s pid=%d start=%lx req_len=%lx dump_len=%lx\n",
-		r->tsk->group_leader->comm, r->tsk->pid, r->start, r->len, dump_len);
 
 	free_page((unsigned long)kbuf);
 	filp_close(fp, NULL);
@@ -322,17 +292,13 @@ static int __init re_dump_init(void)
 	hash_init(g_re.done);
 
 	re_wq = alloc_workqueue("re_dump_wq", WQ_UNBOUND | WQ_HIGHPRI, 4);
-	if (!re_wq) {
-		pr_err("[re_dump] alloc_workqueue failed\n");
+	if (!re_wq)
 		return -ENOMEM;
-	}
 	pr_info("[re_dump] init done, dir=%s\n", re_dump_dir);
 	return 0;
 }
 late_initcall(re_dump_init);
-
 /* ============ END RE DUMP ENGINE ============ */
-
 
 #include "internal.h"
 
@@ -428,9 +394,7 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
 	unsigned long next;
 	unsigned long pages = 0;
 	unsigned long nr_huge_updates = 0;
-	struct mmu_notifier_range range;
-
-	range.start = 0;
+	bool mmu_invalidated = false;
 
 	pmd = pmd_offset(pud, addr);
 	do {
@@ -452,11 +416,21 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
 					page = p;
 			}
 
+			/*
+			 * Checking to see if the MMU-notifiers have already
+			 * been called must be done while holding the ptl
+			 * taken by change_huge_pmd.
+			 */
+			this_pages = change_huge_pmd(vma, pmd, addr, newprot,
+						     dirty_accountable,
+						     prot_numa,
+						     &mmu_invalidated);
 			if (this_pages) {
 				pages += this_pages;
 				nr_huge_updates++;
 				continue;
 			}
+			/* drop through if this_pages == 0 */
 			if (pmd_none_or_clear_bad(pmd))
 				continue;
 			this_pages = change_pte_range(vma, pmd, addr, next,
@@ -466,8 +440,8 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
 		pages += this_pages;
 	} while (pmd++, addr = next, addr != end);
 
-	if (range.start)
-		mmu_notifier_invalidate_range_end(&range);
+	if (mmu_invalidated)
+		mmu_notifier_invalidate_range_end(vma->vm_mm, start, end);
 
 	if (nr_huge_updates)
 		count_vm_numa_events(NUMA_HUGE_PTE_UPDATES, nr_huge_updates);
@@ -558,7 +532,7 @@ unsigned long change_protection(struct vm_area_struct *vma, unsigned long start,
 	return pages;
 }
 
-static int
+int
 mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 	unsigned long start, unsigned long end, unsigned long newflags)
 {
@@ -577,11 +551,17 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 
 	/*
 	 * If we make a private mapping writable we increase our commit;
-	 * but we have to be careful about reservations for shared mappings
-	 * that are currently readonly and may later be made writable.
+	 * but (without finer accounting) cannot reduce our commit if we
+	 * make it unwritable again. hugetlb mapping were accounted for
+	 * even if read-only so there is no need to account for them here
 	 */
 	if (newflags & VM_WRITE) {
-		if (!(oldflags & (VM_ACCOUNT|VM_WRITE|VM_SHARED|VM_HUGETLB))) {
+		/* Check space limits when area turns into data. */
+		if (!may_expand_vm(mm, newflags, nrpages) &&
+				may_expand_vm(mm, oldflags, nrpages))
+			return -ENOMEM;
+		if (!(oldflags & (VM_ACCOUNT|VM_WRITE|VM_HUGETLB|
+						VM_SHARED|VM_NORESERVE))) {
 			charged = nrpages;
 			if (security_vm_enough_memory_mm(mm, charged))
 				return -ENOMEM;
@@ -594,11 +574,11 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 	 */
 	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
 	*pprev = vma_merge(mm, *pprev, start, end, newflags,
-			vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
-			vma->vm_userfaultfd_ctx);
+			   vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
+			   vma->vm_userfaultfd_ctx, vma_get_anon_name(vma));
 	if (*pprev) {
 		vma = *pprev;
-		pr_info("vma_merge success: start=%lx, end=%lx, newflags=%lx\n", start, end, newflags);
+		VM_WARN_ON((vma->vm_flags ^ newflags) & ~VM_SOFTDIRTY);
 		goto success;
 	}
 
@@ -646,7 +626,7 @@ success:
 
 	vm_stat_account(mm, oldflags, -nrpages);
 	vm_stat_account(mm, newflags, nrpages);
-	perf_event_mprotect(vma, start, end, newflags);
+	perf_event_mmap(vma);
 	return 0;
 
 fail:
@@ -681,7 +661,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	end = start + len;
 	if (end <= start)
 		return -ENOMEM;
-	if (!arch_validate_prot(prot, start))
+	if (!arch_validate_prot(prot))
 		return -EINVAL;
 
 	reqprot = prot;
