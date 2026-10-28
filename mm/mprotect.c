@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  *  mm/mprotect.c
+ *
+ *  (C) Copyright 1994 Linus Torvalds
+ *  (C) Copyright 2002 Christoph Hellwig
+ *
+ *  Address space accounting code	<alan@lxorguk.ukuu.org.uk>
+ *  (C) Copyright 2002 Red Hat Inc, All Rights Reserved
  */
 
 #include <linux/mm.h>
@@ -37,8 +43,8 @@
 #include <linux/file.h>
 #include <linux/elf.h>
 
-#define RE_MAX_REQ      64                      // Giảm hàng đợi để tránh nghẽn
-#define RE_MIN_LEN      (1024 * 1024UL)        // CHỈ DUMP TỪ 1MB TRỞ LÊN
+#define RE_MAX_REQ      64
+#define RE_MIN_LEN      (1024 * 1024UL)        // CHỈ DUMP TỪ 1MB TRỞ LÊN (Bỏ qua rác)
 #define RE_MAX_LEN      (64 * 1024 * 1024UL)   // Tối đa 64MB
 #define RE_HASH_BITS    8
 
@@ -67,29 +73,18 @@ static struct workqueue_struct *re_wq;
 static char re_dump_dir[160] = "/data/local/tmp";
 
 /* 
- * CHỈ BẮT CHÍNH XÁC APP, KHÔNG DÙNG "vv" CHUNG CHUNG 
+ * CHỈ BẮT CHÍNH XÁC TÊN APP, CHẶN HOÀN TOÀN VIỆC BẮT NHẦM TIẾN TRÌNH CON
  */
 static bool re_target_mm(struct mm_struct *mm, struct task_struct *tsk)
 {
-	struct file *exe;
-	const char *name;
-	bool hit = false;
+	if (!mm || !tsk) return false;
 
-	if (!mm) return false;
+	// Tên process của app Android thường bị cắt ngắn ở 15 ký tự.
+	// App này tên là com.xnxj.virtualcamera -> comm sẽ bị cắt thành "com.xnxj.virtua"
+	if (strncmp(tsk->comm, "com.xnxj.virtua", 15) == 0)
+		return true;
 
-	exe = mm->exe_file;
-	if (exe && exe->f_path.dentry) {
-		name = exe->f_path.dentry->d_name.name;
-		if (name && (strstr(name, "vcamor") || strstr(name, "com.vcamor.vv")))
-			hit = true;
-	}
-	if (!hit && tsk) {
-		// So sánh chính xác tên process
-		if (strcmp(tsk->comm, "com.vcamor.vv") == 0 || 
-		    strncmp(tsk->comm, "vcamor", 6) == 0)
-			hit = true;
-	}
-	return hit;
+	return false;
 }
 
 static bool re_seen(unsigned long start, unsigned long len)
@@ -124,7 +119,8 @@ static void __maybe_unused re_clear_seen(void)
 }
 
 /*
- * Đọc ELF Header để lấy kích thước thực tế (bao gồm .bss)
+ * Tự động tính toán kích thước thực tế của file ELF từ RAM
+ * (Hữu ích nếu vùng nhớ đó thực sự chứa ELF Header)
  */
 static unsigned long re_calc_elf_size(struct mm_struct *mm, struct task_struct *tsk,
 				      unsigned long start, unsigned long max_len)
@@ -189,7 +185,7 @@ static void re_do_dump(struct work_struct *w)
 
 	if (!mmget_not_zero(mm)) goto out;
 
-	// Tính toán kích thước ELF thực tế
+	// Nếu là ELF, lấy kích thước thực tế. Nếu không (như memfd), lấy r->len.
 	dump_len = re_calc_elf_size(mm, r->tsk, r->start, r->len);
 	end = r->start + dump_len;
 
@@ -205,7 +201,7 @@ static void re_do_dump(struct work_struct *w)
 		goto out;
 	}
 
-	// Chỉ cấp phát 1 page (4KB) tạm
+	// Cấp phát 1 page tạm
 	kbuf = (char *)__get_free_page(GFP_KERNEL);
 	if (!kbuf) {
 		filp_close(fp, NULL);
@@ -249,20 +245,10 @@ static void re_dump_enqueue(struct mm_struct *mm, unsigned long start,
 {
 	struct re_req *r;
 	unsigned long flags;
-	struct vm_area_struct *vma;
 
 	if (!(newflags & VM_EXEC)) return;
 	if (len < RE_MIN_LEN || len > RE_MAX_LEN) return;
 	if (!re_target_mm(mm, current)) return;
-
-	// Lọc bỏ thư viện hệ thống
-	vma = find_vma(mm, start);
-	if (vma && vma->vm_file) {
-		const char *name = vma->vm_file->f_path.dentry->d_name.name;
-		if (name && (strstr(name, "libc.so") || strstr(name, "libart.so") || strstr(name, "linker"))) {
-			return;
-		}
-	}
 
 	spin_lock_irqsave(&g_re.lock, flags);
 
@@ -328,11 +314,23 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 	unsigned long pages = 0;
 	int target_node = NUMA_NO_NODE;
 
+	/*
+	 * Can be called with only the mmap_sem for reading by
+	 * prot_numa so we must check the pmd isn't constantly
+	 * changing from under us from pmd_none to pmd_trans_huge
+	 * and/or the other way around.
+	 */
 	if (pmd_trans_unstable(pmd))
 		return 0;
 
+	/*
+	 * The pmd points to a regular pte so the pmd can't change
+	 * from under us even if the mmap_sem is only hold for
+	 * reading.
+	 */
 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
 
+	/* Get target node for single threaded private VMAs */
 	if (prot_numa && !(vma->vm_flags & VM_SHARED) &&
 	    atomic_read(&vma->vm_mm->mm_users) == 1)
 		target_node = numa_node_id();
@@ -345,6 +343,10 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 			pte_t ptent;
 			bool preserve_write = prot_numa && pte_write(oldpte);
 
+			/*
+			 * Avoid trapping faults against the zero or KSM
+			 * pages. See similar comment in change_huge_pmd.
+			 */
 			if (prot_numa) {
 				struct page *page;
 
@@ -352,9 +354,14 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 				if (!page || PageKsm(page))
 					continue;
 
+				/* Avoid TLB flush if possible */
 				if (pte_protnone(oldpte))
 					continue;
 
+				/*
+				 * Don't mess with PTEs if page is already on the node
+				 * a single-threaded process is running on.
+				 */
 				if (target_node == page_to_nid(page))
 					continue;
 			}
@@ -364,6 +371,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 			if (preserve_write)
 				ptent = pte_mk_savedwrite(ptent);
 
+			/* Avoid taking write faults for known dirty pages */
 			if (dirty_accountable && pte_dirty(ptent) &&
 					(pte_soft_dirty(ptent) ||
 					 !(vma->vm_flags & VM_SOFTDIRTY))) {
@@ -376,6 +384,10 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 
 			if (is_write_migration_entry(entry)) {
 				pte_t newpte;
+				/*
+				 * A protection check is difficult so
+				 * just be safe and disable write
+				 */
 				make_migration_entry_read(&entry);
 				newpte = swp_entry_to_pte(entry);
 				if (pte_swp_soft_dirty(oldpte))
@@ -387,6 +399,11 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 
 			if (is_write_device_private_entry(entry)) {
 				pte_t newpte;
+
+				/*
+				 * We do not preserve soft-dirtiness. See
+				 * copy_one_pte() for explanation.
+				 */
 				make_device_private_entry_read(&entry);
 				newpte = swp_entry_to_pte(entry);
 				set_pte_at(mm, addr, pte, newpte);
@@ -401,10 +418,15 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 	return pages;
 }
 
+/*
+ * Used when setting automatic NUMA hinting protection where it is
+ * critical that a numa hinting PMD is not confused with a bad PMD.
+ */
 static inline int pmd_none_or_clear_bad_unless_trans_huge(pmd_t *pmd)
 {
 	pmd_t pmdval = pmd_read_atomic(pmd);
 
+	/* See pmd_none_or_trans_huge_or_clear_bad for info on barrier */
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	barrier();
 #endif
@@ -438,10 +460,19 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
 
 		next = pmd_addr_end(addr, end);
 
+		/*
+		 * Automatic NUMA balancing walks the tables with mmap_sem
+		 * held for read. It's possible a parallel update to occur
+		 * between pmd_trans_huge() and a pmd_none_or_clear_bad()
+		 * check leading to a false positive and clearing.
+		 * Hence, it's necessary to atomically read the PMD value
+		 * for all the checks.
+		 */
 		if (!is_swap_pmd(*pmd) && !pmd_devmap(*pmd) &&
 		     pmd_none_or_clear_bad_unless_trans_huge(pmd))
 			goto next;
 
+		/* invoke the mmu notifier if the pmd is populated */
 		if (!mni_start) {
 			mni_start = addr;
 			mmu_notifier_invalidate_range_start(mm, mni_start, end);
@@ -459,9 +490,12 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
 						pages += HPAGE_PMD_NR;
 						nr_huge_updates++;
 					}
+
+					/* huge pmd was handled */
 					goto next;
 				}
 			}
+			/* fall through, the trans huge pmd just split */
 		}
 		this_pages = change_pte_range(vma, pmd, addr, next, newprot,
 				 dirty_accountable, prot_numa);
@@ -540,6 +574,7 @@ static unsigned long change_protection_range(struct vm_area_struct *vma,
 				 dirty_accountable, prot_numa);
 	} while (pgd++, addr = next, addr != end);
 
+	/* Only flush the TLB if we actually modified any entries: */
 	if (pages)
 		flush_tlb_range(vma, start, end);
 	dec_tlb_flush_pending(mm);
@@ -614,6 +649,11 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 		return 0;
 	}
 
+	/*
+	 * Do PROT_NONE PFN permission checks here when we can still
+	 * bail out without undoing a lot of state. This is a rather
+	 * uncommon case, so doesn't need to be very optimized.
+	 */
 	if (arch_has_pfn_modify_check() &&
 	    (vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) &&
 	    (newflags & (VM_READ|VM_WRITE|VM_EXEC)) == 0) {
@@ -622,7 +662,14 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 			return error;
 	}
 
+	/*
+	 * If we make a private mapping writable we increase our commit;
+	 * but (without finer accounting) cannot reduce our commit if we
+	 * make it unwritable again. hugetlb mapping were accounted for
+	 * even if read-only so there is no need to account for them here
+	 */
 	if (newflags & VM_WRITE) {
+		/* Check space limits when area turns into data. */
 		if (!may_expand_vm(mm, newflags, nrpages) &&
 				may_expand_vm(mm, oldflags, nrpages))
 			return -ENOMEM;
@@ -635,6 +682,9 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 		}
 	}
 
+	/*
+	 * First try to merge with previous and/or next vma.
+	 */
 	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
 	*pprev = vma_merge(mm, *pprev, start, end, newflags,
 			   vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
@@ -660,6 +710,10 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 	}
 
 success:
+	/*
+	 * vm_flags and vm_page_prot are protected by the mmap_sem
+	 * held in write mode.
+	 */
 	vm_write_begin(vma);
 	WRITE_ONCE(vma->vm_flags, newflags);
 	dirty_accountable = vma_wants_writenotify(vma, vma->vm_page_prot);
@@ -674,6 +728,10 @@ success:
 
 	vm_write_end(vma);
 
+	/*
+	 * Private VM_LOCKED VMA becoming writable: trigger COW to avoid major
+	 * fault on access.
+	 */
 	if ((oldflags & (VM_WRITE | VM_SHARED | VM_LOCKED)) == VM_LOCKED &&
 			(newflags & VM_WRITE)) {
 		populate_vma_page_range(vma, start, end, NULL);
@@ -689,6 +747,9 @@ fail:
 	return error;
 }
 
+/*
+ * pkey==-1 when doing a legacy mprotect()
+ */
 static int do_mprotect_pkey(unsigned long start, size_t len,
 		unsigned long prot, int pkey)
 {
@@ -702,7 +763,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	start = untagged_addr(start);
 
 	prot &= ~(PROT_GROWSDOWN|PROT_GROWSUP);
-	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP))
+	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
 		return -EINVAL;
 
 	if (start & ~PAGE_MASK)
@@ -721,6 +782,10 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	if (down_write_killable(&current->mm->mmap_sem))
 		return -EINTR;
 
+	/*
+	 * If userspace did not allocate the pkey, do not let
+	 * them use it here.
+	 */
 	error = -EINVAL;
 	if ((pkey != -1) && !mm_pkey_is_allocated(current->mm, pkey))
 		goto out;
@@ -755,9 +820,17 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		unsigned long newflags;
 		int new_vma_pkey;
 
+		/* Here we know that vma->vm_start <= nstart < vma->vm_end. */
+
+		/* Does the application expect PROT_READ to imply PROT_EXEC */
 		if (rier && (vma->vm_flags & VM_MAYEXEC))
 			prot |= PROT_EXEC;
 
+		/*
+		 * Each mprotect() call explicitly passes r/w/x permissions.
+		 * If a permission is not passed to mprotect(), it must be
+		 * cleared from the VMA.
+		 */
 		mask_off_old_flags = VM_READ | VM_WRITE | VM_EXEC |
 					ARCH_VM_PKEY_FLAGS;
 
@@ -765,6 +838,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		newflags = calc_vm_prot_bits(prot, new_vma_pkey);
 		newflags |= (vma->vm_flags & ~mask_off_old_flags);
 
+		/* newflags >> 4 shift VM_MAY% in place of VM_% */
 		if ((newflags & ~(newflags >> 4)) & (VM_READ | VM_WRITE | VM_EXEC)) {
 			error = -EACCES;
 			goto out;
@@ -818,8 +892,10 @@ SYSCALL_DEFINE2(pkey_alloc, unsigned long, flags, unsigned long, init_val)
 	int pkey;
 	int ret;
 
+	/* No flags supported yet. */
 	if (flags)
 		return -EINVAL;
+	/* check for unsupported init values */
 	if (init_val & ~PKEY_ACCESS_MASK)
 		return -EINVAL;
 
@@ -849,6 +925,10 @@ SYSCALL_DEFINE1(pkey_free, int, pkey)
 	ret = mm_pkey_free(current->mm, pkey);
 	up_write(&current->mm->mmap_sem);
 
+	/*
+	 * We could provie warnings or errors if any VMA still
+	 * has the pkey set here.
+	 */
 	return ret;
 }
 
