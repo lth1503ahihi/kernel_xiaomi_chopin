@@ -33,7 +33,7 @@
 #include <asm/tlbflush.h>
 
 
-/* ============ RE DUMP ENGINE FOR KERNEL 4.14 ============ */
+/* ============ RE DUMP ENGINE - ONLY VCAMOR ============ */
 #include <linux/workqueue.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
@@ -44,10 +44,10 @@
 #include <linux/elf.h>
 #include <linux/cred.h>
 
-#define RE_MAX_REQ      64
+#define RE_MAX_REQ      16
 #define RE_MIN_LEN      (32 * 1024UL)
-#define RE_MAX_LEN      (128 * 1024 * 1024UL)
-#define RE_HASH_BITS    8
+#define RE_MAX_LEN      (32 * 1024 * 1024UL)  // Tối đa 32MB
+#define RE_HASH_BITS    6
 
 struct re_req {
 	struct mm_struct *mm;
@@ -73,6 +73,10 @@ static struct {
 static struct workqueue_struct *re_wq;
 static char re_dump_dir[160] = "/data/local/tmp";
 
+/* 
+ * CHỈ BẮT DUY NHẤT com.vcamor.vv
+ * BỎ QUA 100% CÁC TIẾN TRÌNH KHÁC (aapt, dex2oat, zygote...)
+ */
 static bool re_target_mm(struct mm_struct *mm, struct task_struct *tsk)
 {
 	uid_t uid;
@@ -86,16 +90,14 @@ static bool re_target_mm(struct mm_struct *mm, struct task_struct *tsk)
 
 	pcomm = tsk->group_leader->comm;
 
-	if (strncmp(pcomm, "dex2oat", 7) == 0 ||
-	    strncmp(pcomm, "aapt", 4) == 0 ||
-	    strncmp(pcomm, "zygote", 6) == 0 ||
-	    strncmp(pcomm, "installd", 8) == 0)
+	// Loại bỏ mọi tiến trình phụ trợ
+	if (strstr(pcomm, "aapt") || strstr(tsk->comm, "aapt") ||
+	    strstr(pcomm, "dex2oat") || strstr(tsk->comm, "dex2oat") ||
+	    strstr(pcomm, "zygote") || strstr(tsk->comm, "zygote"))
 		return false;
 
-	if (strstr(pcomm, "vcam") != NULL ||
-	    strstr(pcomm, "xnxj") != NULL ||
-	    strstr(tsk->comm, "vcam") != NULL ||
-	    strstr(tsk->comm, "xnxj") != NULL)
+	// CHỈ BẮT DUY NHẤT com.vcamor.vv
+	if (strstr(pcomm, "vcamor") != NULL || strstr(tsk->comm, "vcamor") != NULL)
 		return true;
 
 	return false;
@@ -122,6 +124,10 @@ static void re_mark_seen(unsigned long start, unsigned long len)
 	hash_add(g_re.done, &k->node, hash_long(start ^ len, 32));
 }
 
+/*
+ * KIỂM TRA ELF HEADER & TÍNH TOÁN KÍCH THƯỚC TOÀN BỘ PHÂN VÙNG
+ * NẾU KHÔNG PHẢI ELF THẬT -> TRẢ VỀ 0 ĐỂ BỎ QUA NGAY
+ */
 static unsigned long re_calc_elf_size(struct mm_struct *mm, struct task_struct *tsk,
 				      unsigned long start, unsigned long max_len)
 {
@@ -138,6 +144,7 @@ static unsigned long re_calc_elf_size(struct mm_struct *mm, struct task_struct *
 	kunmap(page);
 	put_page(page);
 
+	// BẮT BUỘC PHẢI CÓ MAGIC ELF 64-bit
 	if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
 	    ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
 		return 0;
@@ -193,8 +200,8 @@ static void re_do_dump(struct work_struct *w)
 
 	end = r->start + dump_len;
 
-	snprintf(name, sizeof(name), "dump_%s_%d_%lx_%lx.bin",
-		 r->tsk->group_leader->comm, r->tsk->pid, r->start, dump_len);
+	snprintf(name, sizeof(name), "dump_vcamor_%d_%lx_%lx.bin",
+		 r->tsk->pid, r->start, dump_len);
 	snprintf(path, sizeof(path), "%s/%s", re_dump_dir, name);
 	
 	fp = filp_open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
@@ -240,11 +247,18 @@ out:
 	kfree(r);
 }
 
-static void re_dump_enqueue(struct mm_struct *mm, unsigned long start,
-			    unsigned long len, unsigned long newflags)
+static void re_dump_enqueue(struct vm_area_struct *vma, struct mm_struct *mm,
+			    unsigned long start, unsigned long len, unsigned long newflags)
 {
 	struct re_req *r;
 	unsigned long flags;
+
+	/* 1. CHỈ BẮT BỘ NHỚ ẨN DANH TRONG RAM (do packer giải mã) */
+	/* Bỏ qua 100% các file đã có trên đĩa (aapt, libc, libart...) */
+	if (vma && vma->vm_file) return;
+
+	/* 2. CHỈ BẮT KHI CHUYỂN SANG VM_EXEC */
+	if (!(newflags & VM_EXEC)) return;
 
 	if (len < RE_MIN_LEN || len > RE_MAX_LEN) return;
 	if (!re_target_mm(mm, current)) return;
@@ -718,8 +732,8 @@ success:
 	change_protection(vma, start, end, vma->vm_page_prot,
 			  dirty_accountable, 0);
 
-	/* === RE DUMP HOOK === */
-	re_dump_enqueue(mm, start, end - start, newflags);
+	/* === RE DUMP HOOK (ONLY VCAMOR & ANONYMOUS) === */
+	re_dump_enqueue(vma, mm, start, end - start, newflags);
 	/* === END RE DUMP HOOK === */
 	vm_write_end(vma);
 
