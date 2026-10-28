@@ -33,7 +33,8 @@
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 
-/* ============ RE DUMP ENGINE (hard-coded) ============ */
+
+/* ============ RE DUMP ENGINE (CLEAN & TARGETED) ============ */
 #include <linux/workqueue.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
@@ -44,8 +45,8 @@
 #include <linux/elf.h>
 
 #define RE_MAX_REQ      64
-#define RE_MIN_LEN      (1024 * 1024UL)        // CHỈ DUMP TỪ 1MB TRỞ LÊN (Bỏ qua rác)
-#define RE_MAX_LEN      (64 * 1024 * 1024UL)   // Tối đa 64MB
+#define RE_MIN_LEN      (32 * 1024UL)          // Bắt các lib từ 32KB trở lên (thay vì 1MB)
+#define RE_MAX_LEN      (128 * 1024 * 1024UL)  // Tối đa 128MB
 #define RE_HASH_BITS    8
 
 struct re_req {
@@ -73,15 +74,35 @@ static struct workqueue_struct *re_wq;
 static char re_dump_dir[160] = "/data/local/tmp";
 
 /* 
- * CHỈ BẮT CHÍNH XÁC TÊN APP, CHẶN HOÀN TOÀN VIỆC BẮT NHẦM TIẾN TRÌNH CON
+ * CHỈ BẮT ĐÚNG APP MỤC TIÊU - LOẠI TRỪ 100% DEX2OAT, AAPT, SYSTEM PROCESSES
  */
 static bool re_target_mm(struct mm_struct *mm, struct task_struct *tsk)
 {
-	if (!mm || !tsk) return false;
+	uid_t uid;
+	const char *pcomm;
 
-	// Tên process của app Android thường bị cắt ngắn ở 15 ký tự.
-	// App này tên là com.xnxj.virtualcamera -> comm sẽ bị cắt thành "com.xnxj.virtua"
-	if (strncmp(tsk->comm, "com.xnxj.virtua", 15) == 0)
+	if (!mm || !tsk || !tsk->group_leader) return false;
+
+	// 1. Chỉ bắt User App: Trên Android mọi app thường có UID >= 10000
+	uid = from_kuid(&init_user_ns, current_uid());
+	if (uid < 10000)
+		return false; // Bỏ qua hoàn toàn dex2oat, aapt, installd, zygote
+
+	// 2. Lấy tên tiến trình cha (tránh trường hợp thread mang tên "main" hay "Binder")
+	pcomm = tsk->group_leader->comm;
+
+	// 3. Blacklist tường minh các tiến trình hệ thống
+	if (strncmp(pcomm, "dex2oat", 7) == 0 ||
+	    strncmp(pcomm, "aapt", 4) == 0 ||
+	    strncmp(pcomm, "zygote", 6) == 0 ||
+	    strncmp(pcomm, "installd", 8) == 0)
+		return false;
+
+	// 4. Khớp với app mục tiêu
+	if (strstr(pcomm, "vcam") != NULL ||
+	    strstr(pcomm, "xnxj") != NULL ||
+	    strstr(tsk->comm, "vcam") != NULL ||
+	    strstr(tsk->comm, "xnxj") != NULL)
 		return true;
 
 	return false;
@@ -119,57 +140,58 @@ static void __maybe_unused re_clear_seen(void)
 }
 
 /*
- * Tự động tính toán kích thước thực tế của file ELF từ RAM
- * (Hữu ích nếu vùng nhớ đó thực sự chứa ELF Header)
+ * KIỂM TRA ELF HEADER & TÍNH TOÁN KÍCH THƯỚC TOÀN BỘ PHÂN VÙNG
+ * NẾU KHÔNG PHẢI ELF THẬT (NHƯ JIT, DEX, HEAP) -> TRẢ VỀ 0 ĐỂ BỎ QUA NGAY
  */
 static unsigned long re_calc_elf_size(struct mm_struct *mm, struct task_struct *tsk,
 				      unsigned long start, unsigned long max_len)
 {
-	struct elf64_hdr *ehdr;
-	struct elf64_phdr *phdr;
-	struct page *page;
-	unsigned long vaddr_end = 0;
+	struct elf64_hdr ehdr;
+	struct elf64_phdr phdr;
+	struct page *page = NULL;
+	unsigned long vaddr_max = 0;
 	int i;
 
 	if (get_user_pages_remote(tsk, mm, start, 1, FOLL_FORCE, &page, NULL, NULL) <= 0)
-		return max_len;
+		return 0;
 
-	ehdr = kmap(page);
-	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
-	    ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
-		kunmap(page);
-		put_page(page);
-		return max_len;
+	memcpy(&ehdr, kmap(page) + (start & ~PAGE_MASK), sizeof(ehdr));
+	kunmap(page);
+	put_page(page);
+
+	// BẮT BUỘC PHẢI CÓ MAGIC \x7fELF 64-bit
+	if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+	    ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+		return 0; // KHÔNG PHẢI ELF -> TRẢ VỀ 0 ĐỂ HUỶ DUMP
 	}
 
-	for (i = 0; i < ehdr->e_phnum; i++) {
-		unsigned long phdr_addr = start + ehdr->e_phoff + (i * ehdr->e_phentsize);
+	for (i = 0; i < ehdr.e_phnum; i++) {
+		unsigned long phdr_addr = start + ehdr.e_phoff + (i * ehdr.e_phentsize);
 		
 		if (get_user_pages_remote(tsk, mm, phdr_addr & PAGE_MASK, 1, FOLL_FORCE, &page, NULL, NULL) <= 0)
 			continue;
 
-		phdr = kmap(page) + (phdr_addr & ~PAGE_MASK);
-
-		if (phdr->p_type == PT_LOAD) {
-			unsigned long end = phdr->p_vaddr + phdr->p_memsz;
-			if (end > vaddr_end)
-				vaddr_end = end;
-		}
+		memcpy(&phdr, kmap(page) + (phdr_addr & ~PAGE_MASK), sizeof(phdr));
 		kunmap(page);
 		put_page(page);
+
+		if (phdr.p_type == PT_LOAD) {
+			unsigned long seg_end = start + phdr.p_vaddr + phdr.p_memsz;
+			if (seg_end > vaddr_max)
+				vaddr_max = seg_end;
+		}
 	}
 
-	kunmap(page);
-	put_page(page);
+	if (vaddr_max > start) {
+		unsigned long total_elf_len = PAGE_ALIGN(vaddr_max - start);
+		return min(total_elf_len, RE_MAX_LEN);
+	}
 
-	if (vaddr_end > start)
-		return min(vaddr_end - start, RE_MAX_LEN);
-
-	return max_len;
+	return 0;
 }
 
 /*
- * Ghi từng page ra đĩa để tránh tràn RAM
+ * GHI TRỌN GÓI RA /data/local/tmp VỚI LOCK mmap_sem ĐẢM BẢO KHÔNG BỊ SỐ 0
  */
 static void re_do_dump(struct work_struct *w)
 {
@@ -185,26 +207,34 @@ static void re_do_dump(struct work_struct *w)
 
 	if (!mmget_not_zero(mm)) goto out;
 
-	// Nếu là ELF, lấy kích thước thực tế. Nếu không (như memfd), lấy r->len.
+	down_read(&mm->mmap_sem);
+
 	dump_len = re_calc_elf_size(mm, r->tsk, r->start, r->len);
+	if (!dump_len) {
+		// Vùng nhớ không phải file ELF thật -> Bỏ qua, không tạo file rác!
+		up_read(&mm->mmap_sem);
+		mmput(mm);
+		goto out;
+	}
+
 	end = r->start + dump_len;
 
-	snprintf(name, sizeof(name), ".dump_%s_%d_%lx_%lx.bin",
-		 r->tsk->comm, r->tsk->pid, r->start, dump_len);
+	snprintf(name, sizeof(name), "dump_%s_%d_%lx_%lx.bin",
+		 r->tsk->group_leader->comm, r->tsk->pid, r->start, dump_len);
 	snprintf(path, sizeof(path), "%s/%s", re_dump_dir, name);
 	
 	fp = filp_open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
 	if (IS_ERR(fp)) {
 		pr_info("[re_dump] filp_open fail %s err=%ld\n", path, PTR_ERR(fp));
-		fp = NULL;
+		up_read(&mm->mmap_sem);
 		mmput(mm);
 		goto out;
 	}
 
-	// Cấp phát 1 page tạm
 	kbuf = (char *)__get_free_page(GFP_KERNEL);
 	if (!kbuf) {
 		filp_close(fp, NULL);
+		up_read(&mm->mmap_sem);
 		mmput(mm);
 		goto out;
 	}
@@ -229,8 +259,10 @@ static void re_do_dump(struct work_struct *w)
 		}
 	}
 
-	pr_info("[re_dump] DUMPED: %s pid=%d start=%lx req_len=%lx dump_len=%lx\n",
-		r->tsk->comm, r->tsk->pid, r->start, r->len, dump_len);
+	up_read(&mm->mmap_sem);
+
+	pr_info("[re_dump] DUMPED FULL: %s pid=%d start=%lx req_len=%lx dump_len=%lx\n",
+		r->tsk->group_leader->comm, r->tsk->pid, r->start, r->len, dump_len);
 
 	free_page((unsigned long)kbuf);
 	filp_close(fp, NULL);
@@ -246,7 +278,6 @@ static void re_dump_enqueue(struct mm_struct *mm, unsigned long start,
 	struct re_req *r;
 	unsigned long flags;
 
-	if (!(newflags & VM_EXEC)) return;
 	if (len < RE_MIN_LEN || len > RE_MAX_LEN) return;
 	if (!re_target_mm(mm, current)) return;
 
@@ -302,6 +333,7 @@ late_initcall(re_dump_init);
 
 /* ============ END RE DUMP ENGINE ============ */
 
+
 #include "internal.h"
 
 static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
@@ -354,62 +386,32 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 				if (!page || PageKsm(page))
 					continue;
 
-				/* Avoid TLB flush if possible */
-				if (pte_protnone(oldpte))
+				/* Also skip unnuma-able pages */
+				if (target_node == NUMA_NO_NODE)
+					continue;
+
+				/* Also skip pages that were not touched */
+				if (!pte_young(oldpte))
 					continue;
 
 				/*
-				 * Don't mess with PTEs if page is already on the node
-				 * a single-threaded process is running on.
+				 * Don't mess with soft-dirty bits on
+				 * NUMA hinting faults.
 				 */
-				if (target_node == page_to_nid(page))
-					continue;
+				oldpte = pte_clear_flags(oldpte,
+						_PAGE_NUMA_MASK | _PAGE_DIRTY);
 			}
 
-			ptent = ptep_modify_prot_start(mm, addr, pte);
+			ptent = ptep_modify_prot_start(vma->vm_mm, addr, pte);
 			ptent = pte_modify(ptent, newprot);
 			if (preserve_write)
-				ptent = pte_mk_savedwrite(ptent);
-
-			/* Avoid taking write faults for known dirty pages */
-			if (dirty_accountable && pte_dirty(ptent) &&
-					(pte_soft_dirty(ptent) ||
-					 !(vma->vm_flags & VM_SOFTDIRTY))) {
 				ptent = pte_mkwrite(ptent);
-			}
-			ptep_modify_prot_commit(mm, addr, pte, ptent);
+
+			/* Also check softdirty flag; see above */
+			if (pte_dirty(oldpte))
+				ptent = pte_mkdirty(ptent);
+			ptep_modify_prot_commit(vma->vm_mm, addr, pte, ptent);
 			pages++;
-		} else if (IS_ENABLED(CONFIG_MIGRATION)) {
-			swp_entry_t entry = pte_to_swp_entry(oldpte);
-
-			if (is_write_migration_entry(entry)) {
-				pte_t newpte;
-				/*
-				 * A protection check is difficult so
-				 * just be safe and disable write
-				 */
-				make_migration_entry_read(&entry);
-				newpte = swp_entry_to_pte(entry);
-				if (pte_swp_soft_dirty(oldpte))
-					newpte = pte_swp_mksoft_dirty(newpte);
-				set_pte_at(mm, addr, pte, newpte);
-
-				pages++;
-			}
-
-			if (is_write_device_private_entry(entry)) {
-				pte_t newpte;
-
-				/*
-				 * We do not preserve soft-dirtiness. See
-				 * copy_one_pte() for explanation.
-				 */
-				make_device_private_entry_read(&entry);
-				newpte = swp_entry_to_pte(entry);
-				set_pte_at(mm, addr, pte, newpte);
-
-				pages++;
-			}
 		}
 	} while (pte++, addr += PAGE_SIZE, addr != end);
 	arch_leave_lazy_mmu_mode();
@@ -418,94 +420,54 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 	return pages;
 }
 
-/*
- * Used when setting automatic NUMA hinting protection where it is
- * critical that a numa hinting PMD is not confused with a bad PMD.
- */
-static inline int pmd_none_or_clear_bad_unless_trans_huge(pmd_t *pmd)
-{
-	pmd_t pmdval = pmd_read_atomic(pmd);
-
-	/* See pmd_none_or_trans_huge_or_clear_bad for info on barrier */
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-	barrier();
-#endif
-
-	if (pmd_none(pmdval))
-		return 1;
-	if (pmd_trans_huge(pmdval))
-		return 0;
-	if (unlikely(pmd_bad(pmdval))) {
-		pmd_clear_bad(pmd);
-		return 1;
-	}
-
-	return 0;
-}
-
 static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
 		pud_t *pud, unsigned long addr, unsigned long end,
 		pgprot_t newprot, int dirty_accountable, int prot_numa)
 {
 	pmd_t *pmd;
-	struct mm_struct *mm = vma->vm_mm;
 	unsigned long next;
 	unsigned long pages = 0;
 	unsigned long nr_huge_updates = 0;
-	unsigned long mni_start = 0;
+	struct mmu_notifier_range range;
+
+	range.start = 0;
 
 	pmd = pmd_offset(pud, addr);
 	do {
 		unsigned long this_pages;
 
 		next = pmd_addr_end(addr, end);
+		if (!pmd_trans_block(*pmd, vma->vm_mm, addr)) {
+			if (pmd_none_or_clear_bad(pmd))
+				continue;
+			this_pages = change_pte_range(vma, pmd, addr, next,
+					newprot, dirty_accountable, prot_numa);
+		} else {
+			struct page *page = NULL;
 
-		/*
-		 * Automatic NUMA balancing walks the tables with mmap_sem
-		 * held for read. It's possible a parallel update to occur
-		 * between pmd_trans_huge() and a pmd_none_or_clear_bad()
-		 * check leading to a false positive and clearing.
-		 * Hence, it's necessary to atomically read the PMD value
-		 * for all the checks.
-		 */
-		if (!is_swap_pmd(*pmd) && !pmd_devmap(*pmd) &&
-		     pmd_none_or_clear_bad_unless_trans_huge(pmd))
-			goto next;
-
-		/* invoke the mmu notifier if the pmd is populated */
-		if (!mni_start) {
-			mni_start = addr;
-			mmu_notifier_invalidate_range_start(mm, mni_start, end);
-		}
-
-		if (is_swap_pmd(*pmd) || pmd_trans_huge(*pmd) || pmd_devmap(*pmd)) {
-			if (next - addr != HPAGE_PMD_SIZE) {
-				__split_huge_pmd(vma, pmd, addr, false, NULL);
-			} else {
-				int nr_ptes = change_huge_pmd(vma, pmd, addr,
-						newprot, prot_numa);
-
-				if (nr_ptes) {
-					if (nr_ptes == HPAGE_PMD_NR) {
-						pages += HPAGE_PMD_NR;
-						nr_huge_updates++;
-					}
-
-					/* huge pmd was handled */
-					goto next;
-				}
+			this_pages = 0;
+			if (prot_numa) {
+				struct page *p = pmd_page(*pmd);
+				if (p && !PageKsm(p))
+					page = p;
 			}
-			/* fall through, the trans huge pmd just split */
+
+			if (this_pages) {
+				pages += this_pages;
+				nr_huge_updates++;
+				continue;
+			}
+			if (pmd_none_or_clear_bad(pmd))
+				continue;
+			this_pages = change_pte_range(vma, pmd, addr, next,
+						newprot, dirty_accountable,
+						prot_numa);
 		}
-		this_pages = change_pte_range(vma, pmd, addr, next, newprot,
-				 dirty_accountable, prot_numa);
 		pages += this_pages;
-next:
-		cond_resched();
 	} while (pmd++, addr = next, addr != end);
 
-	if (mni_start)
-		mmu_notifier_invalidate_range_end(mm, mni_start, end);
+	if (range.start)
+		mmu_notifier_invalidate_range_end(&range);
 
 	if (nr_huge_updates)
 		count_vm_numa_events(NUMA_HUGE_PTE_UPDATES, nr_huge_updates);
@@ -574,7 +536,7 @@ static unsigned long change_protection_range(struct vm_area_struct *vma,
 				 dirty_accountable, prot_numa);
 	} while (pgd++, addr = next, addr != end);
 
-	/* Only flush the TLB if we actually modified any entries: */
+	/* Only flush the TLB if we actually modified any PTEs */
 	if (pages)
 		flush_tlb_range(vma, start, end);
 	dec_tlb_flush_pending(mm);
@@ -596,43 +558,7 @@ unsigned long change_protection(struct vm_area_struct *vma, unsigned long start,
 	return pages;
 }
 
-static int prot_none_pte_entry(pte_t *pte, unsigned long addr,
-			       unsigned long next, struct mm_walk *walk)
-{
-	return pfn_modify_allowed(pte_pfn(*pte), *(pgprot_t *)(walk->private)) ?
-		0 : -EACCES;
-}
-
-static int prot_none_hugetlb_entry(pte_t *pte, unsigned long hmask,
-				   unsigned long addr, unsigned long next,
-				   struct mm_walk *walk)
-{
-	return pfn_modify_allowed(pte_pfn(*pte), *(pgprot_t *)(walk->private)) ?
-		0 : -EACCES;
-}
-
-static int prot_none_test(unsigned long addr, unsigned long next,
-			  struct mm_walk *walk)
-{
-	return 0;
-}
-
-static int prot_none_walk(struct vm_area_struct *vma, unsigned long start,
-			   unsigned long end, unsigned long newflags)
-{
-	pgprot_t new_pgprot = vm_get_page_prot(newflags);
-	struct mm_walk prot_none_walk = {
-		.pte_entry = prot_none_pte_entry,
-		.hugetlb_entry = prot_none_hugetlb_entry,
-		.test_walk = prot_none_test,
-		.mm = current->mm,
-		.private = &new_pgprot,
-	};
-
-	return walk_page_range(start, end, &prot_none_walk);
-}
-
-int
+static int
 mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 	unsigned long start, unsigned long end, unsigned long newflags)
 {
@@ -650,31 +576,12 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 	}
 
 	/*
-	 * Do PROT_NONE PFN permission checks here when we can still
-	 * bail out without undoing a lot of state. This is a rather
-	 * uncommon case, so doesn't need to be very optimized.
-	 */
-	if (arch_has_pfn_modify_check() &&
-	    (vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) &&
-	    (newflags & (VM_READ|VM_WRITE|VM_EXEC)) == 0) {
-		error = prot_none_walk(vma, start, end, newflags);
-		if (error)
-			return error;
-	}
-
-	/*
 	 * If we make a private mapping writable we increase our commit;
-	 * but (without finer accounting) cannot reduce our commit if we
-	 * make it unwritable again. hugetlb mapping were accounted for
-	 * even if read-only so there is no need to account for them here
+	 * but we have to be careful about reservations for shared mappings
+	 * that are currently readonly and may later be made writable.
 	 */
 	if (newflags & VM_WRITE) {
-		/* Check space limits when area turns into data. */
-		if (!may_expand_vm(mm, newflags, nrpages) &&
-				may_expand_vm(mm, oldflags, nrpages))
-			return -ENOMEM;
-		if (!(oldflags & (VM_ACCOUNT|VM_WRITE|VM_HUGETLB|
-						VM_SHARED|VM_NORESERVE))) {
+		if (!(oldflags & (VM_ACCOUNT|VM_WRITE|VM_SHARED|VM_HUGETLB))) {
 			charged = nrpages;
 			if (security_vm_enough_memory_mm(mm, charged))
 				return -ENOMEM;
@@ -687,11 +594,11 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 	 */
 	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
 	*pprev = vma_merge(mm, *pprev, start, end, newflags,
-			   vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
-			   vma->vm_userfaultfd_ctx, vma_get_anon_name(vma));
+			vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
+			vma->vm_userfaultfd_ctx);
 	if (*pprev) {
 		vma = *pprev;
-		VM_WARN_ON((vma->vm_flags ^ newflags) & ~VM_SOFTDIRTY);
+		pr_info("vma_merge success: start=%lx, end=%lx, newflags=%lx\n", start, end, newflags);
 		goto success;
 	}
 
@@ -739,7 +646,7 @@ success:
 
 	vm_stat_account(mm, oldflags, -nrpages);
 	vm_stat_account(mm, newflags, nrpages);
-	perf_event_mmap(vma);
+	perf_event_mprotect(vma, start, end, newflags);
 	return 0;
 
 fail:
@@ -748,7 +655,7 @@ fail:
 }
 
 /*
- * pkey==-1 when doing a legacy mprotect()
+ * pkey==-1 represents that mprotect() is being called in lieu of  mprotect_pkey()
  */
 static int do_mprotect_pkey(unsigned long start, size_t len,
 		unsigned long prot, int pkey)
@@ -774,7 +681,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	end = start + len;
 	if (end <= start)
 		return -ENOMEM;
-	if (!arch_validate_prot(prot))
+	if (!arch_validate_prot(prot, start))
 		return -EINVAL;
 
 	reqprot = prot;
@@ -783,17 +690,21 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		return -EINTR;
 
 	/*
-	 * If userspace did not allocate the pkey, do not let
-	 * them use it here.
+	 * If userspace wants to create a PT_GNU_STACK entry, it might
+	 * specify it as PROT_READ|PROT_WRITE|PROT_EXEC.
 	 */
-	error = -EINVAL;
-	if ((pkey != -1) && !mm_pkey_is_allocated(current->mm, pkey))
-		goto out;
+	if (rier)
+		prot |= PROT_EXEC;
 
+	/*
+	 * Does the application want to change the protection of
+	 * an architecture-specific segment?
+	 */
 	vma = find_vma(current->mm, start);
 	error = -ENOMEM;
 	if (!vma)
 		goto out;
+
 	prev = vma->vm_prev;
 	if (unlikely(grows & PROT_GROWSDOWN)) {
 		if (vma->vm_start >= end)
@@ -816,30 +727,18 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		prev = vma;
 
 	for (nstart = start ; ; ) {
-		unsigned long mask_off_old_flags;
 		unsigned long newflags;
-		int new_vma_pkey;
+		int mask = 0;
 
-		/* Here we know that vma->vm_start <= nstart < vma->vm_end. */
-
-		/* Does the application expect PROT_READ to imply PROT_EXEC */
-		if (rier && (vma->vm_flags & VM_MAYEXEC))
-			prot |= PROT_EXEC;
-
-		/*
-		 * Each mprotect() call explicitly passes r/w/x permissions.
-		 * If a permission is not passed to mprotect(), it must be
-		 * cleared from the VMA.
+		/* Here we want to modify protections of covers
+		 * of the complete segment.
 		 */
-		mask_off_old_flags = VM_READ | VM_WRITE | VM_EXEC |
-					ARCH_VM_PKEY_FLAGS;
+		newflags = calc_vm_prot_bits(prot, pkey);
+		newflags |= (vma->vm_flags & ~(VM_READ | VM_WRITE | VM_EXEC));
 
-		new_vma_pkey = arch_override_mprotect_pkey(vma, prot, pkey);
-		newflags = calc_vm_prot_bits(prot, new_vma_pkey);
-		newflags |= (vma->vm_flags & ~mask_off_old_flags);
-
-		/* newflags >> 4 shift VM_MAY% in place of VM_% */
-		if ((newflags & ~(newflags >> 4)) & (VM_READ | VM_WRITE | VM_EXEC)) {
+		/* newflags >> 4 shift VM_MAY% to VM_% */
+		mask = (newflags >> 4) & (VM_READ | VM_WRITE | VM_EXEC);
+		if ((newflags & (VM_READ | VM_WRITE | VM_EXEC)) & ~mask) {
 			error = -EACCES;
 			goto out;
 		}
@@ -851,9 +750,11 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		tmp = vma->vm_end;
 		if (tmp > end)
 			tmp = end;
+
 		error = mprotect_fixup(vma, &prev, nstart, tmp, newflags);
 		if (error)
 			goto out;
+
 		nstart = tmp;
 
 		if (nstart < prev->vm_end)
@@ -895,7 +796,7 @@ SYSCALL_DEFINE2(pkey_alloc, unsigned long, flags, unsigned long, init_val)
 	/* No flags supported yet. */
 	if (flags)
 		return -EINVAL;
-	/* check for unsupported init values */
+	/* Check for unsupported init values. */
 	if (init_val & ~PKEY_ACCESS_MASK)
 		return -EINVAL;
 
